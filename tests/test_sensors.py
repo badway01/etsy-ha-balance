@@ -278,7 +278,7 @@ async def test_etsy_last_order_sensor_with_receipts():
     assert attrs["total_shipping_cost"] == 5.0
     assert attrs["total_tax_cost"] == 1.0
     assert attrs["message_from_buyer"] == "Please ship soon!"
-    assert attrs["status"] == "paid"
+    assert attrs["status"] == "Paid"
     assert attrs["is_paid"] is True
     assert attrs["is_shipped"] is False
 

@@ -863,7 +863,6 @@ class EtsyUpdateCoordinator(DataUpdateCoordinator):
 
     async def _check_for_changes(self, data: dict[str, Any]) -> None:
         """Check for changes in data and fire device trigger events."""
-        # Get device ID for this integration
         from homeassistant.helpers import device_registry as dr
 
         device_registry = dr.async_get(self._hass)
@@ -877,90 +876,165 @@ class EtsyUpdateCoordinator(DataUpdateCoordinator):
         device_id = device.id
         shop = data.get("shop", {})
 
-        # Check for new orders. `new_orders` count is preserved as a delta of
-        # transaction line items (legacy behavior — automations may template
-        # off it). The richer `receipts` payload is built from real receipt
-        # data when available, diffed by receipt_id.
+        # -------------------------------------------------------------
+        # NEW ORDERS
+        #
+        # Primary detection uses receipt IDs instead of the number of
+        # fetched transactions. This remains reliable even when Etsy
+        # returns a fixed-size "recent receipts" window and an old order
+        # drops out at the same time a new order arrives.
+        # -------------------------------------------------------------
         current_transactions_count = data.get("transactions_count", 0)
         current_receipts = data.get("receipts") or []
         current_receipt_ids = {
-            str(r.get("receipt_id")) for r in current_receipts if r.get("receipt_id")
+            str(receipt.get("receipt_id"))
+            for receipt in current_receipts
+            if receipt.get("receipt_id")
         }
 
-        if current_transactions_count > self._prev_transactions_count and self._prev_transactions_count > 0:
-            new_order_count = current_transactions_count - self._prev_transactions_count
-            _LOGGER.debug(
-                "New order detected! Transaction count %s -> %s",
-                self._prev_transactions_count,
-                current_transactions_count,
-            )
+        if current_receipts:
+            # Do not fire all existing receipts as "new" on the first
+            # coordinator refresh after Home Assistant starts.
+            if self._prev_receipt_ids:
+                new_receipt_ids = current_receipt_ids - self._prev_receipt_ids
 
-            transactions = data.get("transactions", [])
-            new_transactions = [
-                build_transaction_detail(t) for t in transactions[:new_order_count]
-            ]
+                if new_receipt_ids:
+                    # current_receipts is sorted newest-first by the fetch code.
+                    new_receipt_objects = [
+                        receipt
+                        for receipt in current_receipts
+                        if str(receipt.get("receipt_id")) in new_receipt_ids
+                    ]
 
-            # Build receipts payload — prefer real receipts diffed by ID,
-            # fall back to client-side grouping when receipt data isn't
-            # present (legacy proxy path).
-            new_receipt_ids = current_receipt_ids - self._prev_receipt_ids
-            if current_receipts and new_receipt_ids:
-                new_receipts = [
-                    build_receipt_summary(r)
-                    for r in current_receipts
-                    if str(r.get("receipt_id")) in new_receipt_ids
+                    new_receipts = [
+                        build_receipt_summary(receipt)
+                        for receipt in new_receipt_objects
+                    ]
+
+                    new_transactions = []
+                    for receipt in new_receipt_objects:
+                        for transaction in receipt.get("transactions") or []:
+                            new_transactions.append(
+                                build_transaction_detail(transaction)
+                            )
+
+                    new_order_count = len(new_receipts)
+
+                    _LOGGER.info(
+                        "New Etsy order detected by receipt ID: %s new receipt(s): %s",
+                        new_order_count,
+                        sorted(new_receipt_ids),
+                    )
+
+                    self._hass.bus.async_fire(
+                        f"{DOMAIN}_new_order",
+                        {
+                            "device_id": device_id,
+                            "shop_name": shop.get("shop_name"),
+                            "new_orders": new_order_count,
+                            "orders": new_transactions,
+                            "receipts": new_receipts,
+                        },
+                    )
+
+        else:
+            # Legacy fallback for a proxy that only provides transactions.
+            # This path is only used when no receipt data is available.
+            if (
+                current_transactions_count > self._prev_transactions_count
+                and self._prev_transactions_count > 0
+            ):
+                new_transaction_count = (
+                    current_transactions_count - self._prev_transactions_count
+                )
+
+                transactions = data.get("transactions", [])
+                new_transactions = [
+                    build_transaction_detail(transaction)
+                    for transaction in transactions[:new_transaction_count]
                 ]
-            else:
+
                 receipt_groups: dict[str, list[dict]] = defaultdict(list)
                 for detail in new_transactions:
-                    key = detail.get("receipt_id") or detail.get("transaction_id") or ""
+                    key = (
+                        detail.get("receipt_id")
+                        or detail.get("transaction_id")
+                        or ""
+                    )
                     receipt_groups[key].append(detail)
+
                 new_receipts = [
                     {
-                        "receipt_id": rid,
+                        "receipt_id": receipt_id,
                         "buyer_user_id": items[0].get("buyer_user_id"),
                         "item_count": len(items),
                         "items": items,
                     }
-                    for rid, items in receipt_groups.items()
+                    for receipt_id, items in receipt_groups.items()
                 ]
 
-            self._hass.bus.async_fire(
-                f"{DOMAIN}_new_order",
-                {
-                    "device_id": device_id,
-                    "shop_name": shop.get("shop_name"),
-                    "new_orders": new_order_count,
-                    "orders": new_transactions,
-                    "receipts": new_receipts,
-                }
-            )
+                _LOGGER.info(
+                    "New Etsy order detected by legacy transaction fallback: "
+                    "%s new transaction(s)",
+                    new_transaction_count,
+                )
+
+                self._hass.bus.async_fire(
+                    f"{DOMAIN}_new_order",
+                    {
+                        "device_id": device_id,
+                        "shop_name": shop.get("shop_name"),
+                        "new_orders": len(new_receipts),
+                        "orders": new_transactions,
+                        "receipts": new_receipts,
+                    },
+                )
+
+        # Store the current snapshot for the next coordinator refresh.
         self._prev_transactions_count = current_transactions_count
         self._prev_receipt_ids = current_receipt_ids
 
-        # Check for new reviews
+        # -------------------------------------------------------------
+        # NEW REVIEWS
+        # -------------------------------------------------------------
         current_review_count = shop.get("review_count", 0)
-        if current_review_count > self._prev_review_count and self._prev_review_count > 0:
-            _LOGGER.debug("New review detected! Count increased from %s to %s", self._prev_review_count, current_review_count)
+        if (
+            current_review_count > self._prev_review_count
+            and self._prev_review_count > 0
+        ):
+            _LOGGER.debug(
+                "New review detected! Count increased from %s to %s",
+                self._prev_review_count,
+                current_review_count,
+            )
             self._hass.bus.async_fire(
                 f"{DOMAIN}_new_review",
                 {
                     "device_id": device_id,
                     "shop_name": shop.get("shop_name"),
-                    "new_reviews": current_review_count - self._prev_review_count,
+                    "new_reviews": (
+                        current_review_count - self._prev_review_count
+                    ),
                     "average_rating": shop.get("review_average", 0),
-                }
+                },
             )
         self._prev_review_count = current_review_count
 
-        # Check for low stock
+        # -------------------------------------------------------------
+        # LOW STOCK
+        # -------------------------------------------------------------
         listings = data.get("listings", [])
         for listing in listings:
             quantity = listing.get("quantity", 0)
-            # Get the stock threshold from options, default to 5
-            stock_threshold = self.config_entry.options.get("stock_threshold", 5)
+            stock_threshold = self.config_entry.options.get(
+                "stock_threshold", 5
+            )
             if quantity > 0 and quantity <= stock_threshold:
-                _LOGGER.debug("Low stock detected for listing: %s (quantity: %s)", listing.get('title'), quantity)
+                _LOGGER.debug(
+                    "Low stock detected for listing: %s (quantity: %s)",
+                    listing.get("title"),
+                    quantity,
+                )
                 self._hass.bus.async_fire(
                     f"{DOMAIN}_low_stock",
                     {
@@ -970,5 +1044,5 @@ class EtsyUpdateCoordinator(DataUpdateCoordinator):
                         "listing_title": listing.get("title"),
                         "quantity": quantity,
                         "threshold": stock_threshold,
-                    }
+                    },
                 )

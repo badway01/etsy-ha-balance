@@ -581,6 +581,7 @@ class EtsyUpdateCoordinator(DataUpdateCoordinator):
             # /payments is one call per receipt, and only EtsyLastOrder
             # surfaces amount_net.
             last_payment = await self._fetch_last_payment_direct(receipts, headers)
+                        account_balance = await self._fetch_account_balance_direct(headers)
 
             # Combine data
             combined_data = {
@@ -589,6 +590,7 @@ class EtsyUpdateCoordinator(DataUpdateCoordinator):
                 "transactions": flattened_transactions,
                 "receipts": receipts,
                 "last_payment": last_payment,
+                                "account_balance": account_balance,
                 "listings_count": listings_data.get("count", 0),
                 "transactions_count": len(flattened_transactions),
                 "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
@@ -604,7 +606,159 @@ class EtsyUpdateCoordinator(DataUpdateCoordinator):
             raise
         except Exception as err:
             raise UpdateFailed(f"Error fetching data from Etsy API: {err}") from err
+    async def _fetch_account_balance_direct(
+        self, headers: dict
+    ) -> dict | None:
+        """Fetch the current Etsy payment account balance."""
 
+        cached_balance = None
+        if isinstance(self._last_successful_data, dict):
+            cached_balance = self._last_successful_data.get("account_balance")
+
+        try:
+            now_ts = int(time.time())
+
+            # Die letzten 31 Tage reichen für den normalen Betrieb.
+            # Bei mehr als 100 Ledger-Einträgen wird anschließend
+            # gezielt die letzte Seite geladen.
+            params = {
+                "min_created": now_ts - (31 * 24 * 60 * 60),
+                "max_created": now_ts + 60,
+                "limit": 100,
+                "offset": 0,
+            }
+
+            url = (
+                f"{ETSY_API_BASE}/shops/{self.shop_id}"
+                "/payment-account/ledger-entries"
+            )
+
+            response = await self.session.get(
+                url,
+                headers=headers,
+                params=params,
+            )
+
+            if response.status == 401:
+                raise ConfigEntryAuthFailed(
+                    "Authentication failed while reading Etsy payment ledger."
+                )
+
+            if response.status == 429:
+                retry_after = response.headers.get("Retry-After", "60")
+                _LOGGER.warning(
+                    "Etsy API rate limit hit on payment ledger. "
+                    "Retry after %s seconds",
+                    retry_after,
+                )
+                return cached_balance
+
+            if response.status == 403:
+                text = await response.text()
+                _LOGGER.warning(
+                    "Etsy payment ledger access denied: %s",
+                    text,
+                )
+                return cached_balance
+
+            if response.status != 200:
+                text = await response.text()
+                _LOGGER.warning(
+                    "Failed to fetch Etsy payment ledger "
+                    "(status %s): %s",
+                    response.status,
+                    text,
+                )
+                return cached_balance
+
+            data = await response.json()
+            results = data.get("results", []) or []
+            count = int(data.get("count", len(results)) or 0)
+
+            # Falls es in 31 Tagen mehr als 100 Einträge gibt,
+            # laden wir gezielt die letzte Seite.
+            if count > len(results):
+                last_offset = max(0, count - 100)
+                last_params = dict(params)
+                last_params["offset"] = last_offset
+
+                last_response = await self.session.get(
+                    url,
+                    headers=headers,
+                    params=last_params,
+                )
+
+                if last_response.status == 200:
+                    last_data = await last_response.json()
+                    last_results = last_data.get("results", []) or []
+
+                    if last_results:
+                        results = last_results
+                else:
+                    _LOGGER.warning(
+                        "Could not fetch final Etsy ledger page "
+                        "(status %s)",
+                        last_response.status,
+                    )
+
+            if not results:
+                _LOGGER.debug(
+                    "No Etsy payment ledger entries found "
+                    "in the requested period"
+                )
+                return cached_balance
+
+            # Höhere sequence_number = neuerer Ledger-Eintrag.
+            # Zeitstempel und entry_id dienen als zusätzliche Absicherung.
+            latest = max(
+                results,
+                key=lambda entry: (
+                    int(entry.get("sequence_number") or 0),
+                    int(
+                        entry.get("created_timestamp")
+                        or entry.get("create_date")
+                        or 0
+                    ),
+                    int(entry.get("entry_id") or 0),
+                ),
+            )
+
+            raw_balance = latest.get("balance")
+
+            if raw_balance is None:
+                _LOGGER.warning(
+                    "Latest Etsy ledger entry contains no balance"
+                )
+                return cached_balance
+
+            currency = latest.get("currency") or "EUR"
+
+            # Etsy liefert Geldbeträge in der kleinsten Währungseinheit.
+            # Für EUR: 47162 -> 471.62 EUR.
+            balance = round(float(raw_balance) / 100.0, 2)
+
+            return {
+                "balance": balance,
+                "balance_minor": raw_balance,
+                "currency": currency,
+                "entry_id": str(latest.get("entry_id", "")),
+                "sequence_number": latest.get("sequence_number"),
+                "description": latest.get("description"),
+                "created_timestamp": (
+                    latest.get("created_timestamp")
+                    or latest.get("create_date")
+                ),
+            }
+
+        except ConfigEntryAuthFailed:
+            raise
+
+        except Exception as err:
+            _LOGGER.warning(
+                "Failed to fetch Etsy account balance: %s",
+                err,
+            )
+            return cached_balance
     async def _fetch_last_payment_direct(
         self, receipts: list[dict], headers: dict
     ) -> dict | None:

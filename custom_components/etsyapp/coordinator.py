@@ -581,7 +581,7 @@ class EtsyUpdateCoordinator(DataUpdateCoordinator):
             # /payments is one call per receipt, and only EtsyLastOrder
             # surfaces amount_net.
             last_payment = await self._fetch_last_payment_direct(receipts, headers)
-                        account_balance = await self._fetch_account_balance_direct(headers)
+            account_balance = await self._fetch_account_balance_direct(headers)
 
             # Combine data
             combined_data = {
@@ -590,7 +590,7 @@ class EtsyUpdateCoordinator(DataUpdateCoordinator):
                 "transactions": flattened_transactions,
                 "receipts": receipts,
                 "last_payment": last_payment,
-                                "account_balance": account_balance,
+                "account_balance": account_balance,
                 "listings_count": listings_data.get("count", 0),
                 "transactions_count": len(flattened_transactions),
                 "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
@@ -606,6 +606,7 @@ class EtsyUpdateCoordinator(DataUpdateCoordinator):
             raise
         except Exception as err:
             raise UpdateFailed(f"Error fetching data from Etsy API: {err}") from err
+
     async def _fetch_account_balance_direct(
         self, headers: dict
     ) -> dict | None:
@@ -759,6 +760,7 @@ class EtsyUpdateCoordinator(DataUpdateCoordinator):
                 err,
             )
             return cached_balance
+
     async def _fetch_last_payment_direct(
         self, receipts: list[dict], headers: dict
     ) -> dict | None:

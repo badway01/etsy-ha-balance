@@ -42,6 +42,7 @@ async def async_setup_entry(
             EtsyActiveListings(coordinator),
             EtsyRecentOrders(coordinator),
             EtsyLastOrder(coordinator),
+            EtsyAccountBalance(coordinator),
             EtsyShopStats(coordinator),
         ],
         update_before_add=True,
@@ -365,6 +366,59 @@ class EtsyLastOrder(CoordinatorEntity, SensorEntity):
             "transactions": grouped[most_recent_id],
         }
         return build_receipt_summary(synthetic_receipt)
+
+
+class EtsyAccountBalance(CoordinatorEntity, SensorEntity):
+    """Representation of the Etsy payment account balance."""
+
+    def __init__(self, coordinator: EtsyUpdateCoordinator) -> None:
+        """Initialize the Etsy account balance sensor."""
+        super().__init__(coordinator)
+        self._hass_custom_attributes = {}
+        self._attr_name = "Etsy Gesamtsaldo"
+        self._attr_unique_id = f"{coordinator.config_entry.entry_id}_account_balance"
+        self._globalid = "etsy_account_balance"
+        self._attr_icon = "mdi:cash-multiple"
+        self._attr_state = None
+        self._attr_unit_of_measurement = None
+        # Associate with device
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, coordinator.config_entry.entry_id)},
+        }
+
+    @property
+    def state(self) -> Any:
+        """Return the current Etsy account balance."""
+        return self._attr_state
+
+    @property
+    def extra_state_attributes(self):
+        """Return Etsy account balance attributes."""
+        return self._hass_custom_attributes
+
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        etsy_data = self.coordinator.data or {}
+        account_balance = etsy_data.get("account_balance")
+
+        if not account_balance:
+            self._attr_state = None
+            self._attr_unit_of_measurement = None
+            self._hass_custom_attributes = {}
+        else:
+            self._attr_state = account_balance.get("balance")
+            self._attr_unit_of_measurement = account_balance.get("currency") or "EUR"
+            self._hass_custom_attributes = {
+                "currency": account_balance.get("currency") or "EUR",
+                "balance_minor": account_balance.get("balance_minor"),
+                "ledger_entry_id": account_balance.get("entry_id"),
+                "sequence_number": account_balance.get("sequence_number"),
+                "description": account_balance.get("description"),
+                "created_timestamp": account_balance.get("created_timestamp"),
+                "last_updated": etsy_data.get("last_updated"),
+            }
+
+        self.async_write_ha_state()
 
 
 class EtsyShopStats(CoordinatorEntity, SensorEntity):
